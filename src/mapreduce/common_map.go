@@ -1,7 +1,12 @@
 package mapreduce
 
 import (
+	"bytes"
+	"encoding/json"
 	"hash/fnv"
+	"io"
+	"log"
+	"os"
 )
 
 func doMap(
@@ -53,6 +58,31 @@ func doMap(
 	//
 	// Your code here (Part I).
 	//
+	fd, err := os.Open(inFile)
+	if err != nil {
+		log.Printf("failed to exec domap for %dst task of %s: %v", mapTask, jobName, err)
+		return
+	}
+	defer fd.Close()
+	buf := bytes.NewBuffer(nil)
+	io.Copy(buf, fd)
+	kvs := mapF(inFile, buf.String())
+	outs := make([]*json.Encoder, 0, nReduce)
+	for i := 0; i < nReduce; i++ {
+		out := reduceName(jobName, mapTask, i)
+		fd, err := os.OpenFile(out, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0777)
+		if err != nil {
+			log.Printf("failed to create intermediate file: %v", err)
+			return
+		}
+		defer fd.Close()
+		outs = append(outs, json.NewEncoder(fd))
+	}
+
+	for _, kv := range kvs {
+		p := ihash(kv.Key) % nReduce
+		outs[p].Encode(kv)
+	}
 }
 
 func ihash(s string) int {

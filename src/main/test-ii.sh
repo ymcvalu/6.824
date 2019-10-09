@@ -14,4 +14,3 @@ echo "Failed test. Output should be as in mr-challenge.txt. Your output differs 
 else
   echo "Passed test" > /dev/stderr
 fi
-

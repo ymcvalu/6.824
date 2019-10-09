@@ -1,9 +1,11 @@
 package main
 
 import (
+	"../mapreduce"
 	"fmt"
-	"mapreduce"
 	"os"
+	"strconv"
+	"unicode"
 )
 
 //
@@ -15,6 +17,24 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+	kvs := make([]mapreduce.KeyValue, 0)
+	sIdx := 0
+	for idx, c := range contents {
+		if !unicode.IsLetter(c) {
+			if idx > sIdx {
+				kvs = append(kvs, mapreduce.KeyValue{
+					Key: contents[sIdx:idx],
+				})
+			}
+			sIdx = idx + 1
+		}
+	}
+	if sIdx < len(contents) {
+		kvs = append(kvs, mapreduce.KeyValue{
+			Key: contents[sIdx:],
+		})
+	}
+	return kvs
 }
 
 //
@@ -23,7 +43,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 // any map task.
 //
 func reduceF(key string, values []string) string {
-	// Your code here (Part II).
+	return strconv.Itoa(len(values))
 }
 
 // Can be run in 3 ways:
