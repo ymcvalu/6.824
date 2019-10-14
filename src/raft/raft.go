@@ -17,13 +17,21 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"sync"
+	"time"
+)
+import "../labrpc"
 
 // import "bytes"
 // import "labgob"
 
 
+type LogEntry struct {
+	Term int
+	Index int
+	Data []byte
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -55,6 +63,21 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// persistent state on all instances
+	currentTerm int
+	voteFor int
+	log []LogEntry
+
+	// volatile state on all instances
+	commitIndex int
+	lastApplied int
+
+	// volatile state on leader
+	nextIndex []int
+	matchIndex []int
+
+	// others
+	electionTimeout time.Timer
 }
 
 // return currentTerm and whether this server
@@ -116,6 +139,11 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term int // candidate's term
+	candidateId int
+	//
+	lastLogIndex int
+	lastLogTerm int
 }
 
 //
@@ -124,6 +152,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term int // current term, for candidate to update itself
+	voteGranted bool // true means candidate received vote
 }
 
 //
