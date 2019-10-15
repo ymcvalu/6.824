@@ -26,11 +26,10 @@ import "../labrpc"
 // import "bytes"
 // import "labgob"
 
-
 type LogEntry struct {
-	Term int
+	Term  int
 	Index int
-	Data []byte
+	Data  []byte
 }
 
 //
@@ -50,6 +49,8 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type TickFunc func()
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -65,19 +66,42 @@ type Raft struct {
 
 	// persistent state on all instances
 	currentTerm int
-	voteFor int
-	log []LogEntry
+	voteFor     int
+	log         []LogEntry
 
 	// volatile state on all instances
 	commitIndex int
 	lastApplied int
 
 	// volatile state on leader
-	nextIndex []int
+	nextIndex  []int
 	matchIndex []int
 
-	// others
-	electionTimeout time.Timer
+	// timeout
+	clock time.Ticker
+	tick  TickFunc
+
+	electionElapsed int
+	electionTimeout int
+
+	heartbeatElapsed int
+	HeartbeatTimeout int
+}
+
+func (r *Raft) heartbeatTick() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.HeartbeatTimeout {
+		// TODO: send heartbeat
+
+		r.heartbeatElapsed = 0
+	}
+}
+
+func (r *Raft) electionTick() {
+	r.electionElapsed++
+	if r.electionElapsed >= r.electionTimeout {
+		// TODO: turn to candidate
+	}
 }
 
 // return currentTerm and whether this server
@@ -89,7 +113,6 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	return term, isleader
 }
-
 
 //
 // save Raft's persistent state to stable storage,
@@ -106,7 +129,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -130,20 +152,17 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term int // candidate's term
+	term        int // candidate's term
 	candidateId int
 	//
 	lastLogIndex int
-	lastLogTerm int
+	lastLogTerm  int
 }
 
 //
@@ -152,7 +171,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term int // current term, for candidate to update itself
+	term        int  // current term, for candidate to update itself
 	voteGranted bool // true means candidate received vote
 }
 
@@ -197,7 +216,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -219,8 +237,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
+}
+
+func (r *Raft) run() {
+	for {
+		select {
+		case <-r.clock.C:
+			r.tick()
+		}
+	}
 }
 
 //
@@ -255,7 +281,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
