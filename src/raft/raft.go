@@ -7,10 +7,10 @@ package raft
 //
 // rf = Make(...)
 //   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
+// rf.Start(command interface{}) (index, Term, isleader)
 //   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
+// rf.GetState() (Term, isLeader)
+//   ask a Raft for its current Term, and whether it thinks it is leader
 // ApplyMsg
 //   each time a new entry is committed to the log, each Raft peer
 //   should send an ApplyMsg to the service (or tester)
@@ -18,14 +18,13 @@ package raft
 //
 
 import (
-	"k8s.io/apimachinery/pkg/util/rand"
+	"6.824/src/labrpc"
+	"math/rand"
 	"sync"
 	"time"
+	// "bytes"
+	// "labgob"
 )
-import "../labrpc"
-
-// import "bytes"
-// import "labgob"
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
@@ -89,8 +88,9 @@ type Raft struct {
 	clock  *time.Ticker
 	tickFn TickFunc
 
-	electionElapsed int
-	electionTimeout int
+	electionElapsed    int
+	electionTimeout    int
+	minElectionTimeout int
 
 	heartbeatElapsed int
 	HeartbeatTimeout int
@@ -99,10 +99,15 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
+
 	// Your code here (2A).
+	rf.mu.Lock()
+	isleader = rf.isLeader
+	term = rf.currentTerm
+	rf.mu.Unlock()
+
 	return term, isleader
 }
 
@@ -150,7 +155,7 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int // candidate's term
+	Term        int // candidate's Term
 	CandidateId int
 	//
 	LastLogIndex int
@@ -163,8 +168,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term        int  // current term, for candidate to update itself
-	voteGranted bool // true means candidate received vote
+	Term        int  // current Term, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 //
@@ -177,19 +182,43 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.becomeFollowerLocked(args.Term, -1)
 	} else if args.Term < rf.currentTerm {
-		reply.term = rf.currentTerm
-		reply.voteGranted = false
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
 		return
 	}
 
-	reply.term = args.Term
+	reply.Term = args.Term
 	if rf.voteFor == -1 {
 		// TODO: check logs
-		reply.voteGranted = true
+		reply.VoteGranted = true
 	} else {
-		reply.voteGranted = false
+		reply.VoteGranted = false
 	}
+}
 
+type AppendEntriesArgs struct {
+	Term int
+	Peer int
+}
+
+type AppendEntriesReply struct {
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.currentTerm <= args.Term {
+		if rf.curLeader != args.Peer {
+			rf.becomeFollowerLocked(args.Term, args.Peer)
+		} else {
+			rf.electionElapsed = 0
+		}
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
 
 //
@@ -222,6 +251,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	// the peers isn't changed, so it's saf
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -237,7 +267,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 // the first return value is the index that the command will appear at
 // if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
+// Term. the third return value is true if this server believes it is
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -250,7 +280,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-func (r *Raft) tick() {
+func (r *Raft) kickoff() {
 	for {
 		<-r.clock.C
 		func() {
@@ -261,29 +291,25 @@ func (r *Raft) tick() {
 	}
 }
 
-func (r *Raft) tickHeartbeatLocked() {
-	r.heartbeatElapsed++
-	if r.heartbeatElapsed >= r.HeartbeatTimeout {
-		r.heartbeatElapsed = 0
-		r.broadcast()
-	}
-}
-
 func (r *Raft) tickElectionLocked() {
 	r.electionElapsed++
 	if r.electionElapsed >= r.electionTimeout {
 		r.becomeCandidateLocked()
+
 		voteReq := &RequestVoteArgs{
-			Term:         r.currentTerm,
-			CandidateId:  r.me,
-			LastLogTerm:  r.logs[len(r.logs)-1].Term,
-			LastLogIndex: r.logs[len(r.logs)-1].Index,
+			Term:        r.currentTerm,
+			CandidateId: r.me,
 		}
+		if len(r.logs) > 0 {
+			voteReq.LastLogTerm = r.logs[len(r.logs)-1].Term
+			voteReq.LastLogIndex = r.logs[len(r.logs)-1].Index
+		}
+
 		for pid := range r.peers {
 			if pid == r.me {
 				continue
 			}
-			// TODO: ugly!!! add async network request queue
+			// TODO: ugly!!!
 			go func(pid int) {
 				reply := &RequestVoteReply{}
 				// TODO: retry when failed?
@@ -296,18 +322,44 @@ func (r *Raft) tickElectionLocked() {
 	}
 }
 
+func (r *Raft) tickHeartbeatLocked() {
+	r.heartbeatElapsed++
+	if r.heartbeatElapsed >= r.HeartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.broadcast()
+	}
+}
+
 // send empty AppendMsg to all peers
 func (r *Raft) broadcast() {
+	for pid := range r.peers {
+		if pid == r.me {
+			continue
+		}
+		req := &AppendEntriesArgs{
+			Term: r.currentTerm,
+			Peer: r.me,
+		}
+		go func(pid int) {
+			reply := &AppendEntriesReply{}
+			if ok := r.sendAppendEntries(pid, req, reply); ok {
+				r.handleAppendEntriesReply(pid, reply)
+			}
+		}(pid)
+	}
+}
+
+func (r *Raft) handleAppendEntriesReply(pid int, reply *AppendEntriesReply) {
 
 }
 
 func (r *Raft) handleVoteReply(pid int, reply *RequestVoteReply) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// there's a bigger term, turn to follower
-	if reply.term > r.currentTerm {
-		r.becomeFollowerLocked(reply.term, -1)
-	} else if !r.isLeader && reply.voteGranted && reply.term == r.currentTerm {
+	// there's a bigger Term, turn to follower
+	if reply.Term > r.currentTerm {
+		r.becomeFollowerLocked(reply.Term, -1)
+	} else if !r.isLeader && reply.VoteGranted && reply.Term == r.currentTerm {
 		r.votes[pid] = true
 		// win!
 		if len(r.votes) >= len(r.peers)/2+1 {
@@ -323,7 +375,7 @@ func (r *Raft) becomeFollowerLocked(term, lead int) {
 	r.curLeader = lead
 	r.isLeader = false
 	r.electionElapsed = 0
-	r.electionTimeout = 10 + rand.Intn(3) // random election timeout
+	r.electionTimeout = r.randomElectionTimeout() // random election timeout
 	r.voteFor = -1
 	r.votes = nil
 	r.tickFn = r.tickElectionLocked
@@ -338,13 +390,18 @@ func (r *Raft) becomeLeaderLocked() {
 }
 
 func (r *Raft) becomeCandidateLocked() {
-	r.currentTerm += 1    // advance current term
+	r.currentTerm += 1    // advance current Term
 	r.electionElapsed = 0 // reset election elapsed
-	r.electionTimeout = 10 + rand.Intn(3)
+	r.electionTimeout = r.randomElectionTimeout()
 	r.voteFor = r.me // vote for self
 	r.votes = map[int]bool{
 		r.me: true,
 	}
+}
+
+// get a random election timeout
+func (rf *Raft) randomElectionTimeout() int {
+	return rf.minElectionTimeout + rand.Intn(5)
 }
 
 //
@@ -374,6 +431,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.minElectionTimeout = 15
+	rf.HeartbeatTimeout = 5
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -382,10 +441,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.becomeFollowerLocked(0, -1)
 
-	rf.clock = time.NewTicker(time.Millisecond * 10)
+	rf.clock = time.NewTicker(time.Millisecond * 30)
 
 	// daemon
-	go rf.tick()
+	go rf.kickoff()
 
 	return rf
 }
