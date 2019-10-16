@@ -58,6 +58,16 @@ type TickFunc func()
 //
 // A Go object implementing a single Raft peer.
 //
+
+type Role uint8
+
+const (
+	_ Role = iota
+	RoleFollower
+	RoleCandidate
+	RoleLeader
+)
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -77,7 +87,7 @@ type Raft struct {
 	votes       map[int]bool
 	commitIndex int
 	lastApplied int
-	isLeader    bool
+	role        Role
 	curLeader   int
 
 	// volatile state on leader
@@ -104,7 +114,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	// Your code here (2A).
 	rf.mu.Lock()
-	isleader = rf.isLeader
+	isleader = rf.role == RoleLeader
 	term = rf.currentTerm
 	rf.mu.Unlock()
 
@@ -197,23 +207,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesArgs struct {
-	Term int
-	Peer int
+	Term     int
+	LeaderId int
 }
 
 type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.currentTerm <= args.Term {
-		if rf.curLeader != args.Peer {
-			rf.becomeFollowerLocked(args.Term, args.Peer)
+		if rf.curLeader != args.LeaderId {
+			rf.becomeFollowerLocked(args.Term, args.LeaderId)
 		} else {
 			rf.electionElapsed = 0
 		}
+	} else {
+		// the leader is expired
+		reply.Term = rf.currentTerm
+		return
 	}
+	reply.Term = args.Term
+
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -337,8 +355,8 @@ func (r *Raft) broadcast() {
 			continue
 		}
 		req := &AppendEntriesArgs{
-			Term: r.currentTerm,
-			Peer: r.me,
+			Term:     r.currentTerm,
+			LeaderId: r.me,
 		}
 		go func(pid int) {
 			reply := &AppendEntriesReply{}
@@ -350,7 +368,11 @@ func (r *Raft) broadcast() {
 }
 
 func (r *Raft) handleAppendEntriesReply(pid int, reply *AppendEntriesReply) {
-
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if reply.Term > r.currentTerm {
+		r.becomeFollowerLocked(reply.Term, -1)
+	}
 }
 
 func (r *Raft) handleVoteReply(pid int, reply *RequestVoteReply) {
@@ -359,7 +381,7 @@ func (r *Raft) handleVoteReply(pid int, reply *RequestVoteReply) {
 	// there's a bigger Term, turn to follower
 	if reply.Term > r.currentTerm {
 		r.becomeFollowerLocked(reply.Term, -1)
-	} else if !r.isLeader && reply.VoteGranted && reply.Term == r.currentTerm {
+	} else if r.role == RoleCandidate && reply.VoteGranted && reply.Term == r.currentTerm {
 		r.votes[pid] = true
 		// win!
 		if len(r.votes) >= len(r.peers)/2+1 {
@@ -373,7 +395,7 @@ func (r *Raft) handleVoteReply(pid int, reply *RequestVoteReply) {
 func (r *Raft) becomeFollowerLocked(term, lead int) {
 	r.currentTerm = term
 	r.curLeader = lead
-	r.isLeader = false
+	r.role = RoleFollower
 	r.electionElapsed = 0
 	r.electionTimeout = r.randomElectionTimeout() // random election timeout
 	r.voteFor = -1
@@ -383,13 +405,14 @@ func (r *Raft) becomeFollowerLocked(term, lead int) {
 
 func (r *Raft) becomeLeaderLocked() {
 	r.curLeader = r.me
-	r.isLeader = true
+	r.role = RoleLeader
 	r.voteFor = -1
 	r.votes = nil
 	r.tickFn = r.tickHeartbeatLocked
 }
 
 func (r *Raft) becomeCandidateLocked() {
+	r.role = RoleCandidate
 	r.currentTerm += 1    // advance current Term
 	r.electionElapsed = 0 // reset election elapsed
 	r.electionTimeout = r.randomElectionTimeout()
