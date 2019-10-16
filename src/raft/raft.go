@@ -27,7 +27,7 @@ import "../labrpc"
 // import "bytes"
 // import "labgob"
 
-func init(){
+func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
@@ -72,22 +72,22 @@ type Raft struct {
 	// persistent state on all instances
 	currentTerm int
 	voteFor     int
-	logs         []LogEntry
+	logs        []LogEntry
 
 	// volatile state on all instances
-	votes map[int]bool
+	votes       map[int]bool
 	commitIndex int
 	lastApplied int
-	isLeader bool
-	curLeader int
+	isLeader    bool
+	curLeader   int
 
 	// volatile state on leader
 	nextIndex  []int
 	matchIndex []int
 
 	// timeout
-	clock *time.Ticker
-	tickFn  TickFunc
+	clock  *time.Ticker
+	tickFn TickFunc
 
 	electionElapsed int
 	electionTimeout int
@@ -172,6 +172,24 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term, -1)
+	} else if args.Term < rf.currentTerm {
+		reply.term = rf.currentTerm
+		reply.voteGranted = false
+		return
+	}
+
+	reply.term = args.Term
+	if rf.voteFor == -1 {
+		// TODO: check logs
+		reply.voteGranted = true
+	} else {
+		reply.voteGranted = false
+	}
+
 }
 
 //
@@ -234,12 +252,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (r *Raft) tick() {
 	for {
-		 <-r.clock.C
-		 func(){
-		 	r.mu.Lock()
-		 	defer r.mu.Unlock()
-			 r.tickFn()
-		 }()
+		<-r.clock.C
+		func() {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.tickFn()
+		}()
 	}
 }
 
@@ -255,24 +273,23 @@ func (r *Raft) tickElectionLocked() {
 	r.electionElapsed++
 	if r.electionElapsed >= r.electionTimeout {
 		r.becomeCandidateLocked()
-        voteReq:=&RequestVoteArgs{
-        	Term:r.currentTerm,
-        	CandidateId:r.me,
-        	LastLogTerm:r.logs[len(r.logs)-1].Term,
-        	LastLogIndex:r.logs[len(r.logs)-1].Index,
-
+		voteReq := &RequestVoteArgs{
+			Term:         r.currentTerm,
+			CandidateId:  r.me,
+			LastLogTerm:  r.logs[len(r.logs)-1].Term,
+			LastLogIndex: r.logs[len(r.logs)-1].Index,
 		}
-		for pid:=range r.peers{
-        	if pid==r.me{
-        		continue
+		for pid := range r.peers {
+			if pid == r.me {
+				continue
 			}
 			// TODO: ugly!!! add async network request queue
-        	go func(pid int){
-        		reply :=&RequestVoteReply{}
-        		// TODO: retry when failed?
-        		ok :=r.sendRequestVote(pid,voteReq,reply)
-        		if ok {
-        			r.handleVoteReply(pid, reply)
+			go func(pid int) {
+				reply := &RequestVoteReply{}
+				// TODO: retry when failed?
+				ok := r.sendRequestVote(pid, voteReq, reply)
+				if ok {
+					r.handleVoteReply(pid, reply)
 				}
 			}(pid)
 		}
@@ -280,20 +297,20 @@ func (r *Raft) tickElectionLocked() {
 }
 
 // send empty AppendMsg to all peers
-func (r *Raft)broadcast(){
+func (r *Raft) broadcast() {
 
 }
 
-func (r *Raft)handleVoteReply(pid int, reply *RequestVoteReply){
+func (r *Raft) handleVoteReply(pid int, reply *RequestVoteReply) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// there's a bigger term, turn to follower
-	if reply.term> r.currentTerm{
-		r.becomeFollowerLocked(reply.term,-1)
-	}else if !r.isLeader && reply.voteGranted && reply.term == r.currentTerm{
+	if reply.term > r.currentTerm {
+		r.becomeFollowerLocked(reply.term, -1)
+	} else if !r.isLeader && reply.voteGranted && reply.term == r.currentTerm {
 		r.votes[pid] = true
 		// win!
-		if len(r.votes) >= len(r.peers)/2+1{
+		if len(r.votes) >= len(r.peers)/2+1 {
 			r.becomeLeaderLocked()
 			// send hb right now
 			r.broadcast()
@@ -301,32 +318,32 @@ func (r *Raft)handleVoteReply(pid int, reply *RequestVoteReply){
 	}
 }
 
-func (r *Raft)becomeFollowerLocked(term, lead int){
+func (r *Raft) becomeFollowerLocked(term, lead int) {
 	r.currentTerm = term
 	r.curLeader = lead
 	r.isLeader = false
 	r.electionElapsed = 0
-	r.electionTimeout = 2 + rand.Intn(3) // random election timeout
+	r.electionTimeout = 10 + rand.Intn(3) // random election timeout
 	r.voteFor = -1
 	r.votes = nil
 	r.tickFn = r.tickElectionLocked
 }
 
-func (r *Raft)becomeLeaderLocked(){
-   r.curLeader = r.me
-   r.isLeader = true
-   r.voteFor = -1
-   r.votes = nil
-   r.tickFn = r.tickHeartbeatLocked
+func (r *Raft) becomeLeaderLocked() {
+	r.curLeader = r.me
+	r.isLeader = true
+	r.voteFor = -1
+	r.votes = nil
+	r.tickFn = r.tickHeartbeatLocked
 }
 
-func (r *Raft)becomeCandidateLocked(){
-	r.currentTerm += 1 // advance current term
+func (r *Raft) becomeCandidateLocked() {
+	r.currentTerm += 1    // advance current term
 	r.electionElapsed = 0 // reset election elapsed
-	r.electionTimeout = 2 + rand.Intn(3)
+	r.electionTimeout = 10 + rand.Intn(3)
 	r.voteFor = r.me // vote for self
 	r.votes = map[int]bool{
-		r.me:true,
+		r.me: true,
 	}
 }
 
@@ -339,7 +356,6 @@ func (r *Raft)becomeCandidateLocked(){
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
-
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -364,10 +380,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.electionTimeout=10
-	rf.HeartbeatTimeout=2+rand.Intn(3)
-	rf.clock=time.NewTicker(time.Millisecond*10)
+	rf.becomeFollowerLocked(0, -1)
+
+	rf.clock = time.NewTicker(time.Millisecond * 10)
+
 	// daemon
 	go rf.tick()
+
 	return rf
 }
