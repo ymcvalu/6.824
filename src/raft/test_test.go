@@ -254,7 +254,7 @@ loop:
 				}
 				cmds = append(cmds, ix)
 			} else {
-				t.Fatalf("value %v is not an int", cmd)
+				t.Fatalf("Command %v is not an int", cmd)
 			}
 		}
 
@@ -466,7 +466,7 @@ loop:
 					// Term changed -- try again
 					continue loop
 				}
-				t.Fatalf("wrong value %v committed for index %v; expected %v\n", cmd, starti+i, cmds)
+				t.Fatalf("wrong Command %v committed for index %v; expected %v\n", cmd, starti+i, cmds)
 			}
 		}
 
@@ -821,7 +821,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 				}
 			}
 			if ok {
-				// maybe leader will commit our value, maybe not.
+				// maybe leader will commit our Command, maybe not.
 				// but don't wait forever.
 				for _, to := range []int{10, 20, 50, 100, 200} {
 					nd, cmd := cfg.nCommitted(index)
@@ -874,7 +874,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 
 		// Make crash/restart infrequent enough that the peers can often
 		// keep up, but not so infrequent that everything has settled
-		// down from one change to the next. Pick a value smaller than
+		// down from one change to the next. Pick a Command smaller than
 		// the election timeout, but not hugely smaller.
 		time.Sleep((RaftElectionTimeout * 7) / 10)
 	}
@@ -921,7 +921,7 @@ func internalChurn(t *testing.T, unreliable bool) {
 			}
 		}
 		if ok == false {
-			cfg.t.Fatalf("didn't find a value")
+			cfg.t.Fatalf("didn't find a Command")
 		}
 	}
 

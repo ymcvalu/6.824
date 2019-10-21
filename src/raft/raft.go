@@ -56,10 +56,6 @@ type ApplyMsg struct {
 
 type TickFunc func()
 
-//
-// A Go object implementing a single Raft peer.
-//
-
 type Role uint8
 
 const (
@@ -68,6 +64,10 @@ const (
 	RoleCandidate
 	RoleLeader
 )
+
+//
+// A Go object implementing a single Raft peer.
+//
 
 type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -107,6 +107,7 @@ type Raft struct {
 
 	// channel
 	msgCh   chan Message
+	propCh  chan Proposal
 	stateCh chan state
 }
 
@@ -169,9 +170,9 @@ func (rf *Raft) readPersist(data []byte) {
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// Term. the third return value is true if this server believes it is
+// the first return Command is the index that the command will appear at
+// if it's ever committed. the second return Command is the current
+// Term. the third return Command is true if this server believes it is
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -180,6 +181,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	ch := make(chan struct{})
+
+	// propose
+	rf.propCh <- Proposal{
+		Command: command,
+		CB: func(_term, _index int, _isLeader bool) {
+			term, index, isLeader = _term, _index, _isLeader
+			close(ch)
+		},
+	}
+
+	// wait for callback
+	<-ch
 
 	return index, term, isLeader
 }
@@ -196,6 +210,8 @@ func (rf *Raft) run() {
 			rf.tickFn()
 		case msg := <-rf.msgCh:
 			rf.step(msg)
+		case p := <-rf.propCh:
+			rf.propose(p)
 		case rf.stateCh <- state{isLeader: rf.role == RoleLeader, term: rf.currentTerm}:
 		}
 	}
@@ -240,6 +256,18 @@ func (rf *Raft) step(msg Message) {
 
 }
 
+func (rf *Raft) propose(prop Proposal) {
+	isLeader := rf.role == RoleLeader
+	if !isLeader {
+		prop.CB(0, 0, false)
+		log.Printf("term[%d]: peer[%d] isn't a leader, and failed to propose a new propoal", rf.currentTerm, rf.me)
+		return
+	}
+
+
+
+}
+
 func (rf *Raft) tickElection() {
 	rf.electionElapsed++
 	if rf.electionElapsed >= rf.electionTimeout {
@@ -266,7 +294,11 @@ func (rf *Raft) tickHeartbeat() {
 }
 
 func (rf *Raft) poll() {
-	// TODO: single-node
+	// single-node
+	if len(rf.peers) == 1 {
+		rf.becomeLeader()
+		return
+	}
 
 	lg := rf.latestLog()
 	msg := Message{
@@ -431,6 +463,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.clock = time.NewTicker(time.Millisecond * 30)
 
 	rf.msgCh = make(chan Message, 1)
+	rf.propCh = make(chan Proposal)
 	rf.stateCh = make(chan state)
 
 	rf.becomeFollower(0, -1)
@@ -465,6 +498,11 @@ type Message struct {
 	Entries []LogEntry
 	Commit  int
 	Reject  bool
+}
+
+type Proposal struct {
+	Command interface{}
+	CB      func(term, index int, isLeader bool) // callback
 }
 
 type Resp struct{}

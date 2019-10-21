@@ -175,7 +175,7 @@ func (cfg *config) start1(i int) {
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
-						// some server has already committed a different value for this entry!
+						// some server has already committed a different Command for this entry!
 						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
 							m.CommandIndex, i, m.Command, j, old)
 					}
@@ -417,7 +417,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // and have to re-submit after giving up.
 // entirely gives up after about 10 seconds.
 // indirectly checks that the servers agree on the
-// same value, since nCommitted() checks this,
+// same Command, since nCommitted() checks this,
 // as do the threads that read from applyCh.
 // returns index.
 // if retry==true, may submit the command multiple
