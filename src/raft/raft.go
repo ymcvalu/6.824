@@ -480,6 +480,10 @@ func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int
 }
 
 func (rf *Raft) logTerm(idx int) (int, int, error) {
+	// there isn't previous log
+	if idx == 0 {
+		return -1, 0, nil
+	}
 	for i := len(rf.logs) - 1; i >= 0; i-- {
 		if rf.logs[i].Index == idx {
 			return i, rf.logs[i].Term, nil
@@ -537,6 +541,8 @@ func (rf *Raft) becomeLeader() {
 	rf.votes = nil
 	rf.tickFn = rf.tickHeartbeat
 	pIndex := rf.latestIndex()
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.matchIndex))
 	for pid := range rf.peers {
 		rf.nextIndex[pid] = pIndex
 	}
