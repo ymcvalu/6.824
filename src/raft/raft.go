@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"6.824/src/labgob"
 	"6.824/src/labrpc"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -98,6 +100,7 @@ type Raft struct {
 	clock  *time.Ticker
 	tickFn TickFunc
 
+	// reset when receiving AppendEntries **from current leader** or **granting** vote to candidate
 	electionElapsed    int
 	electionTimeout    int
 	minElectionTimeout int
@@ -107,7 +110,7 @@ type Raft struct {
 
 	// channel
 	msgCh   chan Message
-	propCh  chan Proposal
+	propCh  chan proposal
 	stateCh chan state
 }
 
@@ -170,30 +173,29 @@ func (rf *Raft) readPersist(data []byte) {
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
-// the first return Command is the index that the command will appear at
-// if it's ever committed. the second return Command is the current
-// Term. the third return Command is true if this server believes it is
+// the first return command is the index that the command will appear at
+// if it's ever committed. the second return command is the current
+// Term. the third return command is true if this server believes it is
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-	ch := make(chan struct{})
+	var (
+		index    int
+		term     int
+		isLeader bool
+		wait     = make(chan struct{})
+	)
 
 	// propose
-	rf.propCh <- Proposal{
-		Command: command,
-		CB: func(_term, _index int, _isLeader bool) {
+	rf.propCh <- proposal{
+		command: command,
+		cb: func(_term, _index int, _isLeader bool) {
 			term, index, isLeader = _term, _index, _isLeader
-			close(ch)
+			close(wait)
 		},
 	}
 
-	// wait for callback
-	<-ch
+	<-wait
 
 	return index, term, isLeader
 }
@@ -228,9 +230,9 @@ func (rf *Raft) step(msg Message) {
 		case MsgHup:
 			rf.poll()
 		case MsgBeat:
-			rf.sendHeartbeat()
-		case MsgAppResp:
-
+			rf.bcastHeartbeat()
+		case MsgProp:
+			rf.bcastAppend()
 		}
 
 		return
@@ -252,20 +254,114 @@ func (rf *Raft) step(msg Message) {
 	case MsgApp:
 		rf.handleAppendMsg(msg)
 	case MsgAppResp:
+
 	}
 
 }
 
-func (rf *Raft) propose(prop Proposal) {
+func (rf *Raft) propose(prop proposal) {
 	isLeader := rf.role == RoleLeader
 	if !isLeader {
-		prop.CB(0, 0, false)
+		prop.cb(0, 0, false)
 		log.Printf("term[%d]: peer[%d] isn't a leader, and failed to propose a new propoal", rf.currentTerm, rf.me)
 		return
 	}
+	idx := rf.latestIndex() + 1
+	msg := Message{
+		Type: MsgProp,
+		From: rf.me,
+		To:   rf.me,
+	}
 
+	// append
+	rf.logs = append(rf.logs, LogEntry{
+		Term:  rf.currentTerm,
+		Index: idx,
+		Data:  encode(prop.command),
+	})
 
+	go prop.cb(rf.currentTerm, idx, true)
 
+	rf.step(msg)
+}
+
+func (rf *Raft) poll() {
+	// single-node
+	if len(rf.peers) == 1 {
+		rf.becomeLeader()
+		return
+	}
+
+	pTerm := rf.latestTerm()
+	pIndex := rf.latestIndex()
+	msg := Message{
+		Type:    MsgVote,
+		Term:    rf.currentTerm,
+		LogTerm: pTerm,
+		Index:   pIndex,
+	}
+	rf.bcastMsgParallel(msg)
+}
+
+func (rf *Raft) handleVoteReq(req Message) {
+	resp := Message{
+		Type: MsgVoteResp,
+	}
+	// the req from a smaller term or we have voted to others
+	if req.Term < rf.currentTerm || (rf.voteFor != -1 && rf.voteFor != req.From) {
+		resp.Term = rf.currentTerm
+		resp.Reject = true
+	} else {
+		pTerm := rf.latestTerm()
+		pIndex := rf.latestIndex()
+		resp.Term = req.Term
+
+		resp.Reject = !(req.LogTerm > pTerm || (req.LogTerm == pTerm && req.Index >= pIndex))
+	}
+
+	if !resp.Reject {
+		// reset electionElapsed when granting vote to a candidate
+		rf.electionElapsed = 0
+		if rf.voteFor == -1 {
+			rf.voteFor = req.From
+		}
+	}
+
+	rf.sendMsg(req.From, resp)
+}
+
+func (rf *Raft) handleVoteResp(msg Message) {
+	if rf.role == RoleCandidate && !msg.Reject && msg.Term == rf.currentTerm {
+		rf.votes[msg.From] = true
+		// win!
+		if len(rf.votes) >= len(rf.peers)/2+1 {
+			rf.becomeLeader()
+			// we have won! notify other peers right now
+			rf.step(Message{
+				Type: MsgBeat,
+				From: rf.me,
+				To:   rf.me,
+			})
+		}
+	}
+}
+
+func (rf *Raft) bcastHeartbeat() {
+	if rf.role != RoleLeader {
+		panic(fmt.Sprintf("incorrectly state: a peer broadcastPallel heartbeat with role[%d]", rf.role))
+	}
+
+	pTerm := rf.latestTerm()
+	pIndex := rf.latestIndex()
+
+	msg := Message{
+		Type:    MsgApp,
+		Term:    rf.currentTerm,
+		LogTerm: pTerm,
+		Index:   pIndex,
+		Commit:  rf.commitIndex,
+	}
+	rf.bcastMsgParallel(msg)
 }
 
 func (rf *Raft) tickElection() {
@@ -293,81 +389,131 @@ func (rf *Raft) tickHeartbeat() {
 	}
 }
 
-func (rf *Raft) poll() {
-	// single-node
-	if len(rf.peers) == 1 {
-		rf.becomeLeader()
-		return
-	}
-
-	lg := rf.latestLog()
-	msg := Message{
-		Type:    MsgVote,
-		Term:    rf.currentTerm,
-		LogTerm: lg.Term,
-		Index:   lg.Index,
-	}
-	rf.broadcastParallel(msg)
-}
-
-func (rf *Raft) handleVoteReq(req Message) {
-	resp := Message{
-		Type: MsgVoteResp,
-	}
-	// the req from a smaller term or we have voted to others
-	if req.Term < rf.currentTerm || (rf.voteFor != -1 && rf.voteFor != req.From) {
-		resp.Term = rf.currentTerm
-		resp.Reject = true
-	} else {
-		lg := rf.latestLog()
-		resp.Term = req.Term
-
-		resp.Reject = !(req.LogTerm > lg.Term || (req.LogTerm == lg.Term && req.Index >= lg.Index))
-	}
-	if !resp.Reject && rf.voteFor == -1 {
-		rf.voteFor = req.From
-	}
-
-	rf.sendMsg(req.From, resp)
-}
-
-func (rf *Raft) handleVoteResp(msg Message) {
-	if rf.role == RoleCandidate && !msg.Reject && msg.Term == rf.currentTerm {
-		rf.votes[msg.From] = true
-		// win!
-		if len(rf.votes) >= len(rf.peers)/2+1 {
-			rf.becomeLeader()
-			// we have won! notify other peers right now
-			rf.step(Message{
-				Type: MsgBeat,
-				From: rf.me,
-				To:   rf.me,
-			})
+func (rf *Raft) bcastAppend() {
+	for pid := range rf.peers {
+		if pid == rf.me {
+			continue
 		}
+		rf.sendAppend(pid)
 	}
 }
 
-func (rf *Raft) sendHeartbeat() {
-	if rf.role != RoleLeader {
-		panic(fmt.Sprintf("incorrectly state: a peer broadcastPallel heartbeat with role[%d]", rf.role))
+func (rf *Raft) sendAppend(pid int) {
+	var (
+		nextIdx = rf.nextIndex[pid]
+		pl      LogEntry
+	)
+
+	if nextIdx > 0 {
+		// TODO: may be compacted
+		pl, _ = rf.logAt(nextIdx - 1) // previous log entry
 	}
+
+	// TODO: may be compacted
+	logs, _ := rf.logSlice(nextIdx, -1) // logEntries to send
+
 	msg := Message{
-		Type:   MsgApp,
-		Term:   rf.currentTerm,
-		Commit: rf.commitIndex,
+		Type:    MsgApp,
+		Term:    rf.currentTerm,
+		LogTerm: pl.Term,  // term of previous log entry
+		Index:   pl.Index, // index of previous log entry
+		Entries: logs,
+		Commit:  rf.commitIndex,
 	}
-	rf.broadcastParallel(msg)
+
+	rf.sendMsg(pid, msg)
+
+	if len(logs) > 0 {
+		rf.nextIndex[pid] = logs[len(logs)-1].Index
+	}
 }
 
 func (rf *Raft) handleAppendMsg(msg Message) {
+	if msg.Term < rf.currentTerm {
+		// TODO: notify the old leader?
+		return
+	}
+
+	// reset when receiving AppendEntries from current leader
 	rf.electionElapsed = 0
+
+	pIndex := rf.latestIndex()
+	if msg.Index > pIndex {
+		rf.sendMsg(msg.From, Message{
+			Type:   MsgAppResp,
+			Term:   msg.Term,
+			Index:  pIndex,
+			Reject: true,
+		})
+		return
+	}
+
+	if latest, ok := rf.maybeAppend(msg.LogTerm, msg.Index, msg.Commit, msg.Entries); ok {
+		rf.sendMsg(msg.From, Message{
+			Type:  MsgAppResp,
+			Term:  msg.Term,
+			Index: latest, // match index
+		})
+	} else {
+		rf.sendMsg(msg.From, Message{
+			Type:   MsgAppResp,
+			Term:   msg.Term,
+			Index:  msg.Index, // next index
+			Reject: true,
+		})
+	}
+
+	return
 }
 
-func (rf *Raft) latestLog() (log LogEntry) {
-	if len(rf.logs) > 0 {
-		log = rf.logs[len(rf.logs)-1]
+func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int, bool) {
+	at, _pTerm, _ := rf.logTerm(pIndex)
+	if _pTerm != pTerm {
+		return 0, false
 	}
-	return
+
+	// truncate
+	rf.logs = rf.logs[:at+1]
+	rf.logs = append(rf.logs, logs...)
+
+	return rf.latestIndex(), true
+}
+
+func (rf *Raft) logTerm(idx int) (int, int, error) {
+	for i := len(rf.logs) - 1; i >= 0; i-- {
+		if rf.logs[i].Index == idx {
+			return i, rf.logs[i].Term, nil
+		}
+	}
+	return 0, 0, nil
+}
+
+// logAt
+func (rf *Raft) logAt(at int) (LogEntry, bool) {
+	return rf.logs[at], true
+}
+
+// return rf.logs[from: to)
+func (rf *Raft) logSlice(from, to int) ([]LogEntry, bool) {
+	if to == -1 {
+		to = len(rf.logs)
+	}
+
+	return rf.logs[from:to:to], true
+}
+
+func (rf *Raft) latestTerm() int {
+	if len(rf.logs) > 0 {
+		return rf.logs[len(rf.logs)-1].Term
+	}
+	return 0
+}
+
+func (rf *Raft) latestIndex() int {
+	if len(rf.logs) > 0 {
+		return rf.logs[len(rf.logs)-1].Index
+	}
+	return 0
 }
 
 func (rf *Raft) becomeFollower(term, lead int) {
@@ -390,6 +536,11 @@ func (rf *Raft) becomeLeader() {
 	rf.voteFor = -1
 	rf.votes = nil
 	rf.tickFn = rf.tickHeartbeat
+	pIndex := rf.latestIndex()
+	for pid := range rf.peers {
+		rf.nextIndex[pid] = pIndex
+	}
+
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -416,12 +567,12 @@ func (rf *Raft) sendMsg(pid int, msg Message) {
 	go rf.peers[pid].Call("Raft.Send", msg, &Resp{})
 }
 
-func (rf *Raft) broadcastParallel(msg Message) {
+func (rf *Raft) bcastMsgParallel(msg Message) {
 	for pid := range rf.peers {
 		if pid == rf.me {
 			continue
 		}
-		go rf.sendMsg(pid, msg)
+		rf.sendMsg(pid, msg)
 	}
 }
 
@@ -463,7 +614,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.clock = time.NewTicker(time.Millisecond * 30)
 
 	rf.msgCh = make(chan Message, 1)
-	rf.propCh = make(chan Proposal)
+	rf.propCh = make(chan proposal)
 	rf.stateCh = make(chan state)
 
 	rf.becomeFollower(0, -1)
@@ -500,9 +651,16 @@ type Message struct {
 	Reject  bool
 }
 
-type Proposal struct {
-	Command interface{}
-	CB      func(term, index int, isLeader bool) // callback
+type proposal struct {
+	command interface{}
+	cb      func(term, index int, isLeader bool) // callback
 }
 
 type Resp struct{}
+
+func encode(v interface{}) []byte {
+	labgob.Register(v)
+	buf := bytes.NewBuffer(nil)
+	labgob.NewEncoder(buf).Encode(v)
+	return buf.Bytes()
+}
