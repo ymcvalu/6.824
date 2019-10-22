@@ -437,12 +437,22 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 	// reset when receiving AppendEntries from current leader
 	rf.electionElapsed = 0
 
+	// the msg we have committed
+	if len(msg.Entries) > 0 && msg.Entries[len(msg.Entries)-1].Index <= rf.commitIndex {
+		rf.sendMsg(msg.From, Message{
+			Type:  MsgAppResp,
+			Term:  rf.currentTerm,
+			Index: rf.commitIndex, // match index
+		})
+		return
+	}
+
 	pIndex := rf.latestIndex()
 	if msg.Index > pIndex {
 		rf.sendMsg(msg.From, Message{
 			Type:   MsgAppResp,
-			Term:   msg.Term,
-			Index:  pIndex,
+			Term:   rf.currentTerm,
+			Index:  pIndex, // next index
 			Reject: true,
 		})
 		return
@@ -451,13 +461,13 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 	if latest, ok := rf.maybeAppend(msg.LogTerm, msg.Index, msg.Commit, msg.Entries); ok {
 		rf.sendMsg(msg.From, Message{
 			Type:  MsgAppResp,
-			Term:  msg.Term,
+			Term:  rf.currentTerm,
 			Index: latest, // match index
 		})
 	} else {
 		rf.sendMsg(msg.From, Message{
 			Type:   MsgAppResp,
-			Term:   msg.Term,
+			Term:   rf.currentTerm,
 			Index:  msg.Index, // next index
 			Reject: true,
 		})
@@ -476,7 +486,11 @@ func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int
 	rf.logs = rf.logs[:at+1]
 	rf.logs = append(rf.logs, logs...)
 
-	return rf.latestIndex(), true
+	// update commit index
+	lIndex := rf.latestIndex()
+	rf.commitIndex = min(cIndex, lIndex)
+
+	return lIndex, true
 }
 
 func (rf *Raft) logTerm(idx int) (int, int, error) {
@@ -669,4 +683,11 @@ func encode(v interface{}) []byte {
 	buf := bytes.NewBuffer(nil)
 	labgob.NewEncoder(buf).Encode(v)
 	return buf.Bytes()
+}
+
+func min(i, j int) int {
+	if i <= j {
+		return i
+	}
+	return j
 }
