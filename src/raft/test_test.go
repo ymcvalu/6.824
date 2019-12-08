@@ -485,7 +485,8 @@ loop:
 			continue loop
 		}
 
-		if total2-total1 > (iters+1+3)*3 {
+		// note:in my implement, each msg has two rpc: req rpc and resp rpc, so i change the count limit to x2
+		if total2-total1 > (iters+1+3)*3*2 {
 			t.Fatalf("too many RPCs (%v) for %v entries\n", total2-total1, iters)
 		}
 
@@ -782,6 +783,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 	cfg.end()
 }
+
 
 func internalChurn(t *testing.T, unreliable bool) {
 

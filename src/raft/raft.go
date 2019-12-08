@@ -18,19 +18,21 @@ package raft
 //
 
 import (
+	"6.824/src/labgob"
 	"6.824/src/labrpc"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
 	"sort"
 	"time"
-	// "bytes"
-	// "labgob"
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
+
+const BatchLimit = 10
 
 type LogEntry struct {
 	Term  int
@@ -91,6 +93,8 @@ type Raft struct {
 	role        Role
 	curLeader   int
 
+	shouldPersist bool
+
 	// volatile state on leader
 	nextIndex  []int
 	matchIndex []int
@@ -132,13 +136,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.storage.offset)
+	e.Encode(rf.storage.logs)
+	rf.persister.SaveRaftState(w.Bytes())
 }
 
 //
@@ -149,18 +153,25 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if err := d.Decode(&rf.currentTerm); err != nil {
+		panic(fmt.Errorf("failed to recover currentTerm: %w", err))
+	}
+
+	if err := d.Decode(&rf.voteFor); err != nil {
+		panic(fmt.Errorf("failed to recover voteFor: %w", err))
+	}
+
+	if err := d.Decode(&rf.storage.offset); err != nil {
+		panic(fmt.Errorf("failed to recover offset: %w", err))
+	}
+
+	if err := d.Decode(&rf.storage.logs); err != nil {
+		panic(fmt.Errorf("failed to recover commited logs: %w", err))
+	}
+
 }
 
 //
@@ -197,11 +208,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	<-wait
 
 	return index, term, isLeader
-}
-
-func (rf *Raft) Send(msg Message, _ *Resp) {
-	rf.msgCh <- msg // async communication
-	return
 }
 
 func (rf *Raft) run() {
@@ -259,7 +265,6 @@ func (rf *Raft) step(msg Message) {
 			rf.handleAppendResp(msg)
 		}
 	}
-
 }
 
 func (rf *Raft) propose(prop proposal) {
@@ -279,6 +284,10 @@ func (rf *Raft) _propse(idx int, cmd interface{}) {
 	if rf.storage.append(rf.currentTerm, cmd) != idx {
 		panic(fmt.Errorf("term[%d]: leader[%d] propose cmd with two diff index", rf.currentTerm, rf.me))
 	}
+
+	rf.persist()
+	rf.shouldPersist = false
+
 	rf.matchIndex[rf.me] = idx
 	rf.step(Message{
 		Type: MsgProp,
@@ -328,7 +337,13 @@ func (rf *Raft) handleVoteReq(req Message) {
 		rf.electionElapsed = 0
 		if rf.voteFor == -1 {
 			rf.voteFor = req.From
+			rf.shouldPersist = true
 		}
+	}
+
+	if rf.shouldPersist {
+		rf.shouldPersist = false
+		rf.persist()
 	}
 
 	rf.sendMsg(req.From, resp)
@@ -365,6 +380,7 @@ func (rf *Raft) bcastHeartbeat() {
 		LogTerm: pTerm,
 		Index:   pIndex,
 		Commit:  rf.storage.commit,
+		Ctx:     "beat",
 	}
 	rf.bcastMsgParallel(msg)
 }
@@ -374,6 +390,9 @@ func (rf *Raft) tickElection() {
 	if rf.electionElapsed >= rf.electionTimeout {
 		log.Printf("term[%d]: peer[%d] election timeout", rf.currentTerm, rf.me)
 		rf.becomeCandidate()
+		rf.persist()
+		rf.shouldPersist = false
+
 		rf.step(Message{
 			Type: MsgHup,
 			From: rf.me,
@@ -413,7 +432,7 @@ func (rf *Raft) sendAppend(pid int, allowEmpty bool) {
 		pl = rf.storage.logAt(nextIdx - 1) // previous log entry
 	}
 
-	logs := rf.storage.slice(nextIdx, -1) // logEntries to send
+	logs := rf.storage.slice(nextIdx, -1, BatchLimit) // logEntries to send
 
 	if len(logs) == 0 && !allowEmpty {
 		return
@@ -426,6 +445,7 @@ func (rf *Raft) sendAppend(pid int, allowEmpty bool) {
 		Index:   pl.Index, // index of previous log entry
 		Entries: logs,
 		Commit:  rf.storage.commit,
+		Ctx:     "app",
 	}
 
 	rf.sendMsg(pid, msg)
@@ -435,10 +455,19 @@ func (rf *Raft) sendAppend(pid int, allowEmpty bool) {
 	}
 }
 
+func (rf *Raft) Send(msg Message, _ *Resp) {
+	rf.msgCh <- msg // async communication
+	return
+}
+
 func (rf *Raft) handleAppendMsg(msg Message) {
-	log.Printf("term[%d] peer[%d] receive a append msg from peer[%d]", rf.currentTerm, rf.me, msg.From)
+	log.Printf("term[%d]: peer[%d] receive a %s msg from peer[%d], with %d logs", rf.currentTerm, rf.me, msg.Ctx, msg.From, len(msg.Entries))
 	if msg.Term < rf.currentTerm {
-		// TODO: notify the old leader?
+		rf.sendMsg(msg.From, Message{
+			Type:   MsgAppResp,
+			Term:   rf.currentTerm,
+			Reject: true,
+		})
 		return
 	}
 
@@ -474,20 +503,29 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 		return
 	}
 
+	var resp Message
 	if latest, ok := rf.maybeAppend(msg.LogTerm, msg.Index, msg.Commit, msg.Entries); ok {
-		rf.sendMsg(msg.From, Message{
+		resp = Message{
 			Type:  MsgAppResp,
 			Term:  rf.currentTerm,
 			Index: latest, // match index
-		})
+		}
+
 	} else {
-		rf.sendMsg(msg.From, Message{
+		next := rf.storage.latestIndexPreTerm(msg.Index)
+		resp = Message{
 			Type:   MsgAppResp,
 			Term:   rf.currentTerm,
-			Index:  msg.Index, // next index
+			Index:  next, // next index
 			Reject: true,
-		})
+		}
 	}
+
+	if rf.shouldPersist {
+		rf.shouldPersist = false
+		rf.persist()
+	}
+	rf.sendMsg(msg.From, resp)
 
 	return
 }
@@ -503,7 +541,7 @@ func (rf *Raft) handleAppendResp(msg Message) {
 		cIdx := rf.calcCommitIndex()
 		// can't commit logs from previous term directly
 		if rf.storage.logAt(cIdx).Term == rf.currentTerm {
-			rf.storage.commitAt(rf.currentTerm, rf.me, cIdx)
+			rf.storage.commitAt(cIdx)
 		}
 	} else {
 		rf.nextIndex[msg.From] = msg.Index
@@ -524,12 +562,15 @@ func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int
 	if len(logs) > 0 {
 		at := rf.storage.findConflict(logs)
 		logs = logs[at:]
+
+		rf.shouldPersist = true
+
 		last = rf.storage.truncateAndAppend(logs)
 	} else {
 		last = rf.storage.latestIndex()
 	}
 
-	rf.storage.commitAt(rf.currentTerm, rf.me, cIndex)
+	rf.storage.commitAt(cIndex)
 
 	return last, true
 }
@@ -551,6 +592,7 @@ func (rf *Raft) becomeFollower(term, lead int) {
 	if term != rf.currentTerm {
 		rf.currentTerm = term
 		rf.voteFor = -1
+		rf.shouldPersist = true
 	}
 	rf.curLeader = lead
 	rf.role = RoleFollower
@@ -585,6 +627,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.electionElapsed = 0 // reset election elapsed
 	rf.electionTimeout = rf.randomElectionTimeout()
 	rf.voteFor = rf.me // vote for self
+	rf.shouldPersist = true
 	rf.votes = map[int]bool{
 		rf.me: true,
 	}
@@ -596,6 +639,7 @@ func (rf *Raft) randomElectionTimeout() int {
 }
 
 func (rf *Raft) sendMsg(pid int, msg Message) {
+
 	msg.From = rf.me
 	msg.To = pid
 	go rf.peers[pid].Call("Raft.Send", msg, &Resp{})
@@ -638,12 +682,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.minElectionTimeout = 10
-	rf.HeartbeatTimeout = 5
+	rf.HeartbeatTimeout = 3
 
 	// Your initialization code here (2A, 2B, 2C).
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	rf.clock = time.NewTicker(time.Millisecond * 60)
 
@@ -657,6 +698,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	rf.becomeFollower(0, -1)
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	// daemon
 	go rf.run()
@@ -679,6 +723,7 @@ const (
 )
 
 type Message struct {
+	Ctx     string
 	Type    MsgType
 	From    int
 	To      int
@@ -704,8 +749,12 @@ type storage struct {
 	commit  int
 }
 
-func (s *storage) commitAt(term, id int, cIdx int) {
-	if s.latestIndex() >= cIdx && s.commit < cIdx {
+func (s *storage) commitAt(cIdx int) {
+	if s.latestIndex() < cIdx {
+		cIdx = s.latestIndex()
+	}
+
+	if s.commit < cIdx {
 		lastCommit := s.commit
 		s.commit = cIdx
 		lastIdx := lastCommit - s.offset
@@ -718,7 +767,6 @@ func (s *storage) commitAt(term, id int, cIdx int) {
 			}
 		}
 	}
-
 }
 
 func (s *storage) truncateAndAppend(logs []LogEntry) int {
@@ -751,7 +799,7 @@ func (s *storage) findConflict(logs []LogEntry) int {
 	return len(logs)
 }
 
-func (s *storage) slice(i, j int) []LogEntry {
+func (s *storage) slice(i, j, limit int) []LogEntry {
 	var (
 		off = i - s.offset
 		l   = len(s.logs)
@@ -759,6 +807,10 @@ func (s *storage) slice(i, j int) []LogEntry {
 
 	if j > i && j < s.latestIndex() {
 		l = j - s.offset + 1
+	}
+
+	if l-off > limit {
+		l = off + limit
 	}
 
 	if off >= 0 && len(s.logs) > off {
@@ -806,4 +858,28 @@ func (s *storage) logAt(idx int) LogEntry {
 		return s.logs[_idx]
 	}
 	return LogEntry{}
+}
+
+func (s *storage) latestIndexPreTerm(idx int) int {
+	off := idx - s.offset
+
+	term := s.logs[off].Term
+
+	cOff := s.commit - s.offset
+	for off >= 0 {
+		if off-1 > cOff {
+			off--
+			if s.logs[off].Term != term {
+				break
+			}
+		} else {
+			break
+		}
+	}
+
+	if off >= 0 {
+		return s.logs[off].Index
+	} else {
+		return s.offset
+	}
 }
