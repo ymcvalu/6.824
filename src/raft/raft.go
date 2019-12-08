@@ -442,6 +442,14 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 		return
 	}
 
+	if rf.role != RoleFollower {
+		rf.becomeFollower(msg.Term, msg.From)
+	}
+
+	if rf.curLeader != msg.From {
+		rf.curLeader = msg.From
+	}
+
 	// reset when receiving AppendEntries from current leader
 	rf.electionElapsed = 0
 
@@ -540,13 +548,15 @@ func (rf *Raft) calcCommitIndex() int {
 
 func (rf *Raft) becomeFollower(term, lead int) {
 	log.Printf("term[%d]: peer[%d] becomd follower", rf.currentTerm, rf.me)
-
-	rf.currentTerm = term
+	if term != rf.currentTerm {
+		rf.currentTerm = term
+		rf.voteFor = -1
+	}
 	rf.curLeader = lead
 	rf.role = RoleFollower
 	rf.electionElapsed = 0
 	rf.electionTimeout = rf.randomElectionTimeout() // random election timeout
-	rf.voteFor = -1
+
 	rf.votes = nil
 	rf.tickFn = rf.tickElection
 }
@@ -555,7 +565,7 @@ func (rf *Raft) becomeLeader() {
 	log.Printf("term[%d]: peer[%d] becomd leader", rf.currentTerm, rf.me)
 	rf.curLeader = rf.me
 	rf.role = RoleLeader
-	rf.voteFor = -1
+
 	rf.votes = nil
 	rf.tickFn = rf.tickHeartbeat
 	rf.nextIndex = make([]int, len(rf.peers))
