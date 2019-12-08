@@ -18,12 +18,11 @@ package raft
 //
 
 import (
-	"6.824/src/labgob"
 	"6.824/src/labrpc"
-	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"time"
 	// "bytes"
 	// "labgob"
@@ -36,7 +35,7 @@ func init() {
 type LogEntry struct {
 	Term  int
 	Index int
-	Data  []byte
+	Data  interface{}
 }
 
 //
@@ -83,11 +82,11 @@ type Raft struct {
 	// persistent state on all instances
 	currentTerm int
 	voteFor     int
-	logs        []LogEntry
+
+	storage storage
 
 	// volatile state on all instances
 	votes       map[int]bool
-	commitIndex int
 	lastApplied int
 	role        Role
 	curLeader   int
@@ -252,9 +251,13 @@ func (rf *Raft) step(msg Message) {
 	case MsgVoteResp:
 		rf.handleVoteResp(msg)
 	case MsgApp:
-		rf.handleAppendMsg(msg)
+		if rf.role != RoleLeader {
+			rf.handleAppendMsg(msg)
+		}
 	case MsgAppResp:
-
+		if rf.role == RoleLeader {
+			rf.handleAppendResp(msg)
+		}
 	}
 
 }
@@ -266,23 +269,22 @@ func (rf *Raft) propose(prop proposal) {
 		log.Printf("term[%d]: peer[%d] isn't a leader, and failed to propose a new propoal", rf.currentTerm, rf.me)
 		return
 	}
-	idx := rf.latestIndex() + 1
-	msg := Message{
+
+	idx := rf.storage.latestIndex() + 1
+	go prop.cb(rf.currentTerm, idx, true)
+	rf._propse(idx, prop.command)
+}
+
+func (rf *Raft) _propse(idx int, cmd interface{}) {
+	if rf.storage.append(rf.currentTerm, cmd) != idx {
+		panic(fmt.Errorf("term[%d]: leader[%d] propose cmd with two diff index", rf.currentTerm, rf.me))
+	}
+	rf.matchIndex[rf.me] = idx
+	rf.step(Message{
 		Type: MsgProp,
 		From: rf.me,
 		To:   rf.me,
-	}
-
-	// append
-	rf.logs = append(rf.logs, LogEntry{
-		Term:  rf.currentTerm,
-		Index: idx,
-		Data:  encode(prop.command),
 	})
-
-	go prop.cb(rf.currentTerm, idx, true)
-
-	rf.step(msg)
 }
 
 func (rf *Raft) poll() {
@@ -292,8 +294,10 @@ func (rf *Raft) poll() {
 		return
 	}
 
-	pTerm := rf.latestTerm()
-	pIndex := rf.latestIndex()
+	log.Printf("term[%d]: peer[%d] send votes", rf.currentTerm, rf.me)
+
+	pTerm := rf.storage.latestTerm()
+	pIndex := rf.storage.latestIndex()
 	msg := Message{
 		Type:    MsgVote,
 		Term:    rf.currentTerm,
@@ -312,8 +316,8 @@ func (rf *Raft) handleVoteReq(req Message) {
 		resp.Term = rf.currentTerm
 		resp.Reject = true
 	} else {
-		pTerm := rf.latestTerm()
-		pIndex := rf.latestIndex()
+		pTerm := rf.storage.latestTerm()
+		pIndex := rf.storage.latestIndex()
 		resp.Term = req.Term
 
 		resp.Reject = !(req.LogTerm > pTerm || (req.LogTerm == pTerm && req.Index >= pIndex))
@@ -337,6 +341,7 @@ func (rf *Raft) handleVoteResp(msg Message) {
 		if len(rf.votes) >= len(rf.peers)/2+1 {
 			rf.becomeLeader()
 			// we have won! notify other peers right now
+
 			rf.step(Message{
 				Type: MsgBeat,
 				From: rf.me,
@@ -351,15 +356,15 @@ func (rf *Raft) bcastHeartbeat() {
 		panic(fmt.Sprintf("incorrectly state: a peer broadcastPallel heartbeat with role[%d]", rf.role))
 	}
 
-	pTerm := rf.latestTerm()
-	pIndex := rf.latestIndex()
+	pTerm := rf.storage.latestTerm()
+	pIndex := rf.storage.latestIndex()
 
 	msg := Message{
 		Type:    MsgApp,
 		Term:    rf.currentTerm,
 		LogTerm: pTerm,
 		Index:   pIndex,
-		Commit:  rf.commitIndex,
+		Commit:  rf.storage.commit,
 	}
 	rf.bcastMsgParallel(msg)
 }
@@ -394,23 +399,25 @@ func (rf *Raft) bcastAppend() {
 		if pid == rf.me {
 			continue
 		}
-		rf.sendAppend(pid)
+		rf.sendAppend(pid, true)
 	}
 }
 
-func (rf *Raft) sendAppend(pid int) {
+func (rf *Raft) sendAppend(pid int, allowEmpty bool) {
 	var (
 		nextIdx = rf.nextIndex[pid]
 		pl      LogEntry
 	)
 
-	if nextIdx > 0 {
-		// TODO: may be compacted
-		pl, _ = rf.logAt(nextIdx - 1) // previous log entry
+	if nextIdx > 1 {
+		pl = rf.storage.logAt(nextIdx - 1) // previous log entry
 	}
 
-	// TODO: may be compacted
-	logs, _ := rf.logSlice(nextIdx, -1) // logEntries to send
+	logs := rf.storage.slice(nextIdx, -1) // logEntries to send
+
+	if len(logs) == 0 && !allowEmpty {
+		return
+	}
 
 	msg := Message{
 		Type:    MsgApp,
@@ -418,17 +425,18 @@ func (rf *Raft) sendAppend(pid int) {
 		LogTerm: pl.Term,  // term of previous log entry
 		Index:   pl.Index, // index of previous log entry
 		Entries: logs,
-		Commit:  rf.commitIndex,
+		Commit:  rf.storage.commit,
 	}
 
 	rf.sendMsg(pid, msg)
 
 	if len(logs) > 0 {
-		rf.nextIndex[pid] = logs[len(logs)-1].Index
+		rf.nextIndex[pid] = logs[len(logs)-1].Index + 1
 	}
 }
 
 func (rf *Raft) handleAppendMsg(msg Message) {
+	log.Printf("term[%d] peer[%d] receive a append msg from peer[%d]", rf.currentTerm, rf.me, msg.From)
 	if msg.Term < rf.currentTerm {
 		// TODO: notify the old leader?
 		return
@@ -438,16 +446,16 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 	rf.electionElapsed = 0
 
 	// the msg we have committed
-	if len(msg.Entries) > 0 && msg.Entries[len(msg.Entries)-1].Index <= rf.commitIndex {
+	if len(msg.Entries) > 0 && msg.Entries[len(msg.Entries)-1].Index <= rf.storage.commit {
 		rf.sendMsg(msg.From, Message{
 			Type:  MsgAppResp,
 			Term:  rf.currentTerm,
-			Index: rf.commitIndex, // match index
+			Index: rf.storage.commit, // match index
 		})
 		return
 	}
 
-	pIndex := rf.latestIndex()
+	pIndex := rf.storage.latestIndex()
 	if msg.Index > pIndex {
 		rf.sendMsg(msg.From, Message{
 			Type:   MsgAppResp,
@@ -476,62 +484,58 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 	return
 }
 
+func (rf *Raft) handleAppendResp(msg Message) {
+	if !msg.Reject {
+		if rf.matchIndex[msg.From] < msg.Index {
+			rf.matchIndex[msg.From] = msg.Index
+		}
+		if rf.nextIndex[msg.From] < msg.Index+1 {
+			rf.nextIndex[msg.From] = msg.Index + 1
+		}
+		cIdx := rf.calcCommitIndex()
+		// can't commit logs from previous term directly
+		if rf.storage.logAt(cIdx).Term == rf.currentTerm {
+			rf.storage.commitAt(rf.currentTerm, rf.me, cIdx)
+		}
+	} else {
+		rf.nextIndex[msg.From] = msg.Index
+	}
+
+	rf.sendAppend(msg.From, false)
+}
+
 func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int, bool) {
-	at, _pTerm, _ := rf.logTerm(pIndex)
+
+	_pTerm := rf.storage.termAt(pIndex)
+
 	if _pTerm != pTerm {
 		return 0, false
 	}
 
-	// truncate
-	rf.logs = rf.logs[:at+1]
-	rf.logs = append(rf.logs, logs...)
-
-	// update commit index
-	lIndex := rf.latestIndex()
-	rf.commitIndex = min(cIndex, lIndex)
-
-	return lIndex, true
-}
-
-func (rf *Raft) logTerm(idx int) (int, int, error) {
-	// there isn't previous log
-	if idx == 0 {
-		return -1, 0, nil
-	}
-	for i := len(rf.logs) - 1; i >= 0; i-- {
-		if rf.logs[i].Index == idx {
-			return i, rf.logs[i].Term, nil
-		}
-	}
-	return 0, 0, nil
-}
-
-// logAt
-func (rf *Raft) logAt(at int) (LogEntry, bool) {
-	return rf.logs[at], true
-}
-
-// return rf.logs[from: to)
-func (rf *Raft) logSlice(from, to int) ([]LogEntry, bool) {
-	if to == -1 {
-		to = len(rf.logs)
+	var last int
+	if len(logs) > 0 {
+		at := rf.storage.findConflict(logs)
+		logs = logs[at:]
+		last = rf.storage.truncateAndAppend(logs)
+	} else {
+		last = rf.storage.latestIndex()
 	}
 
-	return rf.logs[from:to:to], true
+	rf.storage.commitAt(rf.currentTerm, rf.me, cIndex)
+
+	return last, true
 }
 
-func (rf *Raft) latestTerm() int {
-	if len(rf.logs) > 0 {
-		return rf.logs[len(rf.logs)-1].Term
-	}
-	return 0
-}
+func (rf *Raft) calcCommitIndex() int {
+	mi := make([]int, len(rf.matchIndex))
+	copy(mi, rf.matchIndex)
+	sort.Ints(mi)
 
-func (rf *Raft) latestIndex() int {
-	if len(rf.logs) > 0 {
-		return rf.logs[len(rf.logs)-1].Index
+	cidx := mi[(len(rf.peers)-1)/2]
+	if cidx > rf.storage.commit {
+		return cidx
 	}
-	return 0
+	return rf.storage.commit
 }
 
 func (rf *Raft) becomeFollower(term, lead int) {
@@ -554,9 +558,9 @@ func (rf *Raft) becomeLeader() {
 	rf.voteFor = -1
 	rf.votes = nil
 	rf.tickFn = rf.tickHeartbeat
-	pIndex := rf.latestIndex()
 	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.matchIndex))
+	rf.matchIndex = make([]int, len(rf.peers))
+	pIndex := rf.storage.latestIndex()
 	for pid := range rf.peers {
 		rf.nextIndex[pid] = pIndex
 	}
@@ -623,7 +627,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.minElectionTimeout = 15
+	rf.minElectionTimeout = 10
 	rf.HeartbeatTimeout = 5
 
 	// Your initialization code here (2A, 2B, 2C).
@@ -631,11 +635,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.clock = time.NewTicker(time.Millisecond * 30)
+	rf.clock = time.NewTicker(time.Millisecond * 60)
 
 	rf.msgCh = make(chan Message, 1)
 	rf.propCh = make(chan proposal)
 	rf.stateCh = make(chan state)
+
+	rf.storage = storage{
+		offset:  1,
+		applyCh: applyCh,
+	}
 
 	rf.becomeFollower(0, -1)
 
@@ -678,16 +687,113 @@ type proposal struct {
 
 type Resp struct{}
 
-func encode(v interface{}) []byte {
-	labgob.Register(v)
-	buf := bytes.NewBuffer(nil)
-	labgob.NewEncoder(buf).Encode(v)
-	return buf.Bytes()
+type storage struct {
+	applyCh chan ApplyMsg
+	logs    []LogEntry
+	offset  int // index of first log engry in logs
+	commit  int
 }
 
-func min(i, j int) int {
-	if i <= j {
-		return i
+func (s *storage) commitAt(term, id int, cIdx int) {
+	if s.latestIndex() >= cIdx && s.commit < cIdx {
+		lastCommit := s.commit
+		s.commit = cIdx
+		lastIdx := lastCommit - s.offset
+		curIdx := cIdx - s.offset
+		for _, l := range s.logs[lastIdx+1 : curIdx+1] {
+			s.applyCh <- ApplyMsg{
+				CommandValid: true,
+				CommandIndex: l.Index,
+				Command:      l.Data,
+			}
+		}
 	}
-	return j
+
+}
+
+func (s *storage) truncateAndAppend(logs []LogEntry) int {
+	if len(logs) == 0 {
+		return s.latestIndex()
+	}
+
+	fir := logs[0]
+	switch lastIdx := s.latestIndex(); {
+	case lastIdx+1 == fir.Index:
+		s.logs = append(s.logs, logs...)
+	case lastIdx >= fir.Index:
+		for i := len(s.logs) - 1; i >= 0; i-- {
+			if s.logs[i].Index == fir.Index {
+				s.logs = append(s.logs[:i], logs...)
+				break
+			}
+		}
+	}
+
+	return s.latestIndex()
+}
+
+func (s *storage) findConflict(logs []LogEntry) int {
+	for i, l := range logs {
+		if s.termAt(l.Index) != l.Term {
+			return i
+		}
+	}
+	return len(logs)
+}
+
+func (s *storage) slice(i, j int) []LogEntry {
+	var (
+		off = i - s.offset
+		l   = len(s.logs)
+	)
+
+	if j > i && j < s.latestIndex() {
+		l = j - s.offset + 1
+	}
+
+	if off >= 0 && len(s.logs) > off {
+		return s.logs[off:l]
+	}
+
+	return nil
+}
+
+func (s *storage) termAt(idx int) int {
+	off := idx - s.offset
+	if off >= 0 && len(s.logs) > off {
+		return s.logs[off].Term
+	}
+	return 0
+}
+
+func (s *storage) append(t int, cmd interface{}) int {
+	idx := s.latestIndex() + 1
+	s.logs = append(s.logs, LogEntry{
+		Term:  t,
+		Index: idx,
+		Data:  cmd,
+	})
+	return idx
+}
+
+func (s *storage) latestTerm() int {
+	if len(s.logs) == 0 { // TODO: 如果添加快照机制的话，offset需要更新
+		return 0
+	}
+	return s.logs[len(s.logs)-1].Term
+}
+
+func (s *storage) latestIndex() int {
+	if len(s.logs) == 0 {
+		return s.offset - 1
+	}
+	return s.logs[len(s.logs)-1].Index
+}
+
+func (s *storage) logAt(idx int) LogEntry {
+	_idx := idx - s.offset
+	if _idx >= 0 && _idx < len(s.logs) {
+		return s.logs[_idx]
+	}
+	return LogEntry{}
 }
