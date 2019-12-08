@@ -141,6 +141,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
 	e.Encode(rf.storage.offset)
+	e.Encode(rf.storage.commit)
 	e.Encode(rf.storage.logs)
 	rf.persister.SaveRaftState(w.Bytes())
 }
@@ -166,6 +167,10 @@ func (rf *Raft) readPersist(data []byte) {
 
 	if err := d.Decode(&rf.storage.offset); err != nil {
 		panic(fmt.Errorf("failed to recover offset: %w", err))
+	}
+
+	if err := d.Decode(&rf.storage.commit); err != nil {
+		panic(fmt.Errorf("fialed to recover commit index: %w", err))
 	}
 
 	if err := d.Decode(&rf.storage.logs); err != nil {
@@ -541,7 +546,10 @@ func (rf *Raft) handleAppendResp(msg Message) {
 		cIdx := rf.calcCommitIndex()
 		// can't commit logs from previous term directly
 		if rf.storage.logAt(cIdx).Term == rf.currentTerm {
-			rf.storage.commitAt(cIdx)
+			if rf.storage.commitAt(cIdx) {
+				rf.shouldPersist = false
+				rf.persist()
+			}
 		}
 	} else {
 		rf.nextIndex[msg.From] = msg.Index
@@ -570,7 +578,9 @@ func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int
 		last = rf.storage.latestIndex()
 	}
 
-	rf.storage.commitAt(cIndex)
+	if rf.storage.commitAt(cIndex) {
+		rf.shouldPersist = true
+	}
 
 	return last, true
 }
@@ -749,7 +759,7 @@ type storage struct {
 	commit  int
 }
 
-func (s *storage) commitAt(cIdx int) {
+func (s *storage) commitAt(cIdx int) bool {
 	if s.latestIndex() < cIdx {
 		cIdx = s.latestIndex()
 	}
@@ -766,7 +776,9 @@ func (s *storage) commitAt(cIdx int) {
 				Command:      l.Data,
 			}
 		}
+		return true
 	}
+	return false
 }
 
 func (s *storage) truncateAndAppend(logs []LogEntry) int {
@@ -864,17 +876,16 @@ func (s *storage) latestIndexPreTerm(idx int) int {
 	off := idx - s.offset
 
 	term := s.logs[off].Term
-
 	cOff := s.commit - s.offset
-	for off >= 0 {
-		if off-1 > cOff {
-			off--
-			if s.logs[off].Term != term {
-				break
-			}
-		} else {
+	for off > cOff && off >= 0 {
+		if s.logs[off].Term != term {
 			break
 		}
+		off--
+	}
+
+	if off == cOff {
+		off++
 	}
 
 	if off >= 0 {
