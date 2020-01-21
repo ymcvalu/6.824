@@ -238,7 +238,7 @@ func (rf *Raft) step(msg Message) {
 	if msg.From == rf.me {
 		switch msg.Type {
 		case MsgHup:
-			rf.poll()
+			rf.campaign()
 		case MsgBeat:
 			rf.bcastHeartbeat()
 		case MsgProp:
@@ -301,7 +301,7 @@ func (rf *Raft) _propse(idx int, cmd interface{}) {
 	})
 }
 
-func (rf *Raft) poll() {
+func (rf *Raft) campaign() {
 	// single-node
 	if len(rf.peers) == 1 {
 		rf.becomeLeader()
