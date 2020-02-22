@@ -3,8 +3,8 @@ package raftkv
 import (
 	"6.824/src/labgob"
 	"6.824/src/labrpc"
-	"log"
 	"6.824/src/raft"
+	"log"
 	"sync"
 )
 
@@ -17,6 +17,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType uint8
+
+const (
+	_ OpType = iota
+	OpTypePut
+	OpTypeAppend
+	OpTypeGet
+)
 
 type Op struct {
 	// Your definitions here.
@@ -34,7 +42,6 @@ type KVServer struct {
 
 	// Your definitions here.
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.

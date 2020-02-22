@@ -25,6 +25,7 @@ import (
 	"log"
 	"math/rand"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -115,6 +116,8 @@ type Raft struct {
 	msgCh   chan Message
 	propCh  chan proposal
 	stateCh chan state
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
 type state struct {
@@ -134,6 +137,15 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+
+func (rf *Raft) triggerPersist() {
+	//now := time.Now()
+	sig := make(chan struct{})
+	rf.storage.notifyPersistCh <- sig
+	<-sig
+	//log.Printf("peer[%d] persist cost %v", rf.me, time.Now().Sub(now))
+}
+
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	w := new(bytes.Buffer)
@@ -141,7 +153,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
 	e.Encode(rf.storage.offset)
-	e.Encode(rf.storage.commit)
+	e.Encode(rf.storage.commitId)
+	e.Encode(rf.storage.applyId)
 	e.Encode(rf.storage.logs)
 	rf.persister.SaveRaftState(w.Bytes())
 }
@@ -169,8 +182,12 @@ func (rf *Raft) readPersist(data []byte) {
 		panic(fmt.Errorf("failed to recover offset: %w", err))
 	}
 
-	if err := d.Decode(&rf.storage.commit); err != nil {
+	if err := d.Decode(&rf.storage.commitId); err != nil {
 		panic(fmt.Errorf("fialed to recover commit index: %w", err))
+	}
+
+	if err := d.Decode(&rf.storage.applyId); err != nil {
+		panic(fmt.Errorf("fialed to recover apply index: %w", err))
 	}
 
 	if err := d.Decode(&rf.storage.logs); err != nil {
@@ -216,8 +233,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) run() {
+	rf.wg.Add(1)
+	defer rf.wg.Done()
+
 	for {
 		select {
+		case <-rf.stopCh:
+			return
 		case <-rf.clock.C:
 			rf.tickFn()
 		case msg := <-rf.msgCh:
@@ -276,7 +298,7 @@ func (rf *Raft) propose(prop proposal) {
 	isLeader := rf.role == RoleLeader
 	if !isLeader {
 		prop.cb(0, 0, false)
-		log.Printf("term[%d]: peer[%d] isn't a leader, and failed to propose a new propoal", rf.currentTerm, rf.me)
+		//log.Printf("term[%d]: peer[%d] isn't a leader, and failed to propose a new propoal", rf.currentTerm, rf.me)
 		return
 	}
 
@@ -290,8 +312,8 @@ func (rf *Raft) _propse(idx int, cmd interface{}) {
 		panic(fmt.Errorf("term[%d]: leader[%d] propose cmd with two diff index", rf.currentTerm, rf.me))
 	}
 
-	rf.persist()
-	rf.shouldPersist = false
+	//rf.triggerPersist()
+	//rf.shouldPersist = false
 
 	rf.matchIndex[rf.me] = idx
 	rf.step(Message{
@@ -348,7 +370,7 @@ func (rf *Raft) handleVoteReq(req Message) {
 
 	if rf.shouldPersist {
 		rf.shouldPersist = false
-		rf.persist()
+		rf.triggerPersist()
 	}
 
 	rf.sendMsg(req.From, resp)
@@ -360,13 +382,9 @@ func (rf *Raft) handleVoteResp(msg Message) {
 		// win!
 		if len(rf.votes) >= len(rf.peers)/2+1 {
 			rf.becomeLeader()
-			// we have won! notify other peers right now
 
-			rf.step(Message{
-				Type: MsgBeat,
-				From: rf.me,
-				To:   rf.me,
-			})
+			// we have won! notify other peers right now
+			rf.bcastHeartbeat()
 		}
 	}
 }
@@ -384,7 +402,7 @@ func (rf *Raft) bcastHeartbeat() {
 		Term:    rf.currentTerm,
 		LogTerm: pTerm,
 		Index:   pIndex,
-		Commit:  rf.storage.commit,
+		Commit:  rf.storage.commitId,
 		Ctx:     "beat",
 	}
 	rf.bcastMsgParallel(msg)
@@ -395,7 +413,7 @@ func (rf *Raft) tickElection() {
 	if rf.electionElapsed >= rf.electionTimeout {
 		log.Printf("term[%d]: peer[%d] election timeout", rf.currentTerm, rf.me)
 		rf.becomeCandidate()
-		rf.persist()
+		rf.triggerPersist()
 		rf.shouldPersist = false
 
 		rf.step(Message{
@@ -449,7 +467,7 @@ func (rf *Raft) sendAppend(pid int, allowEmpty bool) {
 		LogTerm: pl.Term,  // term of previous log entry
 		Index:   pl.Index, // index of previous log entry
 		Entries: logs,
-		Commit:  rf.storage.commit,
+		Commit:  rf.storage.commitId,
 		Ctx:     "app",
 	}
 
@@ -466,7 +484,8 @@ func (rf *Raft) Send(msg Message, _ *Resp) {
 }
 
 func (rf *Raft) handleAppendMsg(msg Message) {
-	log.Printf("term[%d]: peer[%d] receive a %s msg from peer[%d], with %d logs", rf.currentTerm, rf.me, msg.Ctx, msg.From, len(msg.Entries))
+	log.Printf("term[%d]: peer[%d] receive a %s msg from peer[%d|%d], with %d logs, commit at %d, ", rf.currentTerm, rf.me, msg.Ctx, msg.Term, msg.From, len(msg.Entries), msg.Commit)
+
 	if msg.Term < rf.currentTerm {
 		rf.sendMsg(msg.From, Message{
 			Type:   MsgAppResp,
@@ -488,11 +507,11 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 	rf.electionElapsed = 0
 
 	// the msg we have committed
-	if len(msg.Entries) > 0 && msg.Entries[len(msg.Entries)-1].Index <= rf.storage.commit {
+	if len(msg.Entries) > 0 && msg.Entries[len(msg.Entries)-1].Index <= rf.storage.commitId {
 		rf.sendMsg(msg.From, Message{
 			Type:  MsgAppResp,
 			Term:  rf.currentTerm,
-			Index: rf.storage.commit, // match index
+			Index: rf.storage.commitId, // match index
 		})
 		return
 	}
@@ -528,7 +547,7 @@ func (rf *Raft) handleAppendMsg(msg Message) {
 
 	if rf.shouldPersist {
 		rf.shouldPersist = false
-		rf.persist()
+		rf.triggerPersist()
 	}
 	rf.sendMsg(msg.From, resp)
 
@@ -548,7 +567,7 @@ func (rf *Raft) handleAppendResp(msg Message) {
 		if rf.storage.logAt(cIdx).Term == rf.currentTerm {
 			if rf.storage.commitAt(cIdx) {
 				rf.shouldPersist = false
-				rf.persist()
+				rf.triggerPersist()
 			}
 		}
 	} else {
@@ -560,17 +579,12 @@ func (rf *Raft) handleAppendResp(msg Message) {
 
 func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int, bool) {
 
-	_pTerm := rf.storage.termAt(pIndex)
-
-	if _pTerm != pTerm {
+	if rf.storage.termAt(pIndex) != pTerm {
 		return 0, false
 	}
 
 	var last int
 	if len(logs) > 0 {
-		at := rf.storage.findConflict(logs)
-		logs = logs[at:]
-
 		rf.shouldPersist = true
 
 		last = rf.storage.truncateAndAppend(logs)
@@ -591,10 +605,10 @@ func (rf *Raft) calcCommitIndex() int {
 	sort.Ints(mi)
 
 	cidx := mi[(len(rf.peers)-1)/2]
-	if cidx > rf.storage.commit {
+	if cidx > rf.storage.commitId {
 		return cidx
 	}
-	return rf.storage.commit
+	return rf.storage.commitId
 }
 
 func (rf *Raft) becomeFollower(term, lead int) {
@@ -664,6 +678,36 @@ func (rf *Raft) bcastMsgParallel(msg Message) {
 	}
 }
 
+func (rf *Raft) applyLoop() {
+	rf.wg.Add(1)
+	defer rf.wg.Done()
+	for {
+		select {
+		case <-rf.stopCh:
+			rf.persist()
+			return
+		case sig := <-rf.storage.notifyPersistCh:
+			rf.persist()
+			close(sig)
+		case idx := <-rf.storage.notifyApplyCh:
+			if idx > rf.storage.applyId {
+				cidx := rf.storage.applyId + 1
+				for cidx <= idx {
+					log := rf.storage.logAt(cidx)
+					rf.storage.applyCh <- ApplyMsg{
+						CommandValid: true,
+						CommandIndex: log.Index,
+						Command:      log.Data,
+					}
+					cidx++
+				}
+				rf.storage.applyId = idx
+			}
+
+		}
+	}
+}
+
 //
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
@@ -672,6 +716,9 @@ func (rf *Raft) bcastMsgParallel(msg Message) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	close(rf.stopCh)
+	rf.wg.Wait()
+	log.Printf("peer[%d] exit", rf.me)
 }
 
 //
@@ -687,24 +734,23 @@ func (rf *Raft) Kill() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-	rf.minElectionTimeout = 10
-	rf.HeartbeatTimeout = 3
-
-	// Your initialization code here (2A, 2B, 2C).
-
-	rf.clock = time.NewTicker(time.Millisecond * 60)
-
-	rf.msgCh = make(chan Message, 1)
-	rf.propCh = make(chan proposal)
-	rf.stateCh = make(chan state)
-
-	rf.storage = storage{
-		offset:  1,
-		applyCh: applyCh,
+	rf := &Raft{
+		peers:              peers,
+		persister:          persister,
+		me:                 me,
+		minElectionTimeout: 10,
+		HeartbeatTimeout:   3,
+		clock:              time.NewTicker(time.Millisecond * 60),
+		msgCh:              make(chan Message, 1),
+		propCh:             make(chan proposal),
+		stateCh:            make(chan state),
+		stopCh:             make(chan struct{}),
+		storage: storage{
+			offset:          1,
+			applyCh:         applyCh,
+			notifyApplyCh:   make(chan int, 100),
+			notifyPersistCh: make(chan chan struct{}),
+		},
 	}
 
 	rf.becomeFollower(0, -1)
@@ -713,6 +759,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// daemon
+	go rf.applyLoop()
 	go rf.run()
 
 	return rf
@@ -753,10 +800,13 @@ type proposal struct {
 type Resp struct{}
 
 type storage struct {
-	applyCh chan ApplyMsg
-	logs    []LogEntry
-	offset  int // index of first log engry in logs
-	commit  int
+	logs            []LogEntry
+	offset          int // index of first log engry in logs
+	commitId        int
+	applyId         int
+	applyCh         chan ApplyMsg
+	notifyApplyCh   chan int
+	notifyPersistCh chan chan struct{}
 }
 
 func (s *storage) commitAt(cIdx int) bool {
@@ -764,20 +814,12 @@ func (s *storage) commitAt(cIdx int) bool {
 		cIdx = s.latestIndex()
 	}
 
-	if s.commit < cIdx {
-		lastCommit := s.commit
-		s.commit = cIdx
-		lastIdx := lastCommit - s.offset
-		curIdx := cIdx - s.offset
-		for _, l := range s.logs[lastIdx+1 : curIdx+1] {
-			s.applyCh <- ApplyMsg{
-				CommandValid: true,
-				CommandIndex: l.Index,
-				Command:      l.Data,
-			}
-		}
+	if s.commitId < cIdx {
+		s.commitId = cIdx
+		s.notifyApplyCh <- cIdx
 		return true
 	}
+
 	return false
 }
 
@@ -786,29 +828,20 @@ func (s *storage) truncateAndAppend(logs []LogEntry) int {
 		return s.latestIndex()
 	}
 
-	fir := logs[0]
-	switch lastIdx := s.latestIndex(); {
-	case lastIdx+1 == fir.Index:
-		s.logs = append(s.logs, logs...)
-	case lastIdx >= fir.Index:
-		for i := len(s.logs) - 1; i >= 0; i-- {
-			if s.logs[i].Index == fir.Index {
-				s.logs = append(s.logs[:i], logs...)
-				break
-			}
+	off := logs[0].Index - s.offset
+	i := 0
+
+	for off < len(s.logs) && i < len(logs) {
+		if s.logs[off].Term != logs[i].Term {
+			break
 		}
+		off++
+		i++
 	}
+
+	s.logs = append(s.logs[:off], logs[i:]...)
 
 	return s.latestIndex()
-}
-
-func (s *storage) findConflict(logs []LogEntry) int {
-	for i, l := range logs {
-		if s.termAt(l.Index) != l.Term {
-			return i
-		}
-	}
-	return len(logs)
 }
 
 func (s *storage) slice(i, j, limit int) []LogEntry {
@@ -821,7 +854,7 @@ func (s *storage) slice(i, j, limit int) []LogEntry {
 		l = j - s.offset + 1
 	}
 
-	if l-off > limit {
+	if limit > 0 && l-off > limit {
 		l = off + limit
 	}
 
@@ -876,7 +909,7 @@ func (s *storage) latestIndexPreTerm(idx int) int {
 	off := idx - s.offset
 
 	term := s.logs[off].Term
-	cOff := s.commit - s.offset
+	cOff := s.commitId - s.offset
 	for off > cOff && off >= 0 {
 		if s.logs[off].Term != term {
 			break
@@ -889,7 +922,7 @@ func (s *storage) latestIndexPreTerm(idx int) int {
 	}
 
 	if off >= 0 {
-		return s.logs[off].Index
+		return s.offset + off
 	} else {
 		return s.offset
 	}
