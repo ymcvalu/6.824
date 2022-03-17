@@ -18,8 +18,6 @@ package raft
 //
 
 import (
-	"6.824/src/labgob"
-	"6.824/src/labrpc"
 	"bytes"
 	"fmt"
 	"log"
@@ -27,6 +25,9 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"6.824/src/labgob"
+	"6.824/src/labrpc"
 )
 
 func init() {
@@ -592,7 +593,7 @@ func (rf *Raft) maybeAppend(pTerm int, pIndex, cIndex int, logs []LogEntry) (int
 		last = rf.storage.latestIndex()
 	}
 
-	if rf.storage.commitAt(cIndex) {
+	if rf.storage.commitAt(min(cIndex, pIndex+len(logs))) {
 		rf.shouldPersist = true
 	}
 
